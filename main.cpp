@@ -11,13 +11,8 @@ extern "C" {
 
 int main(void)
 {
-    std::cout << "test ... ... " << std::endl;
-    std::cout << "sunxilong: Hello, FFmpeg!" << std::endl;
     unsigned int version = avformat_version();
-    std::cout << "FFmpeg avformat version: "
-              << ((version >> 16) & 0xFF) << "."   // major
-              << ((version >> 8) & 0xFF) << "."     // minor
-              << (version & 0xFF) << std::endl;      // micro
+    LOGD("FFmpeg avformat version: %d: %d.%d", (version >> 16) & 0xFF, (version >> 8) & 0xFF, version & 0xFF);
     // 打开mp4 文件
     AVFormatContext* fmtCtx = nullptr;
     const char* filePath = "./res/test_zzz.mp4";
@@ -25,27 +20,26 @@ int main(void)
     // 1. 分配 AVFormatContext 内存
     fmtCtx = avformat_alloc_context();
     if (!fmtCtx) {
-        std::cerr << "内存分配失败" << std::endl;
+        LOGD("avformat_alloc_context failed");
         return -1;
     }
 
     // 2. 调用 avformat_open_input 打开 MP4 文件
     // 参数依次为：上下文指针、文件路径、输入格式（通常传NULL让FFmpeg自动探测）、附加选项
     if (avformat_open_input(&fmtCtx, filePath, nullptr, nullptr) != 0) {
-        std::cerr << "无法打开文件: " << filePath << std::endl;
+        LOGD("open failed: %s", filePath);
         return -1;
     }
 
     // 3. 获取流信息（读取音视频流的基本参数）
     if (avformat_find_stream_info(fmtCtx, nullptr) < 0) {
-        std::cerr << "无法获取流信息" << std::endl;
+        LOGD("get stream info failed");
         avformat_close_input(&fmtCtx); // 记得关闭文件
         return -1;
     }
-
-    std::cout << "成功打开 MP4 文件！" << std::endl;
+    LOGD("file path: %s open success", fmtCtx->url);
     // 可以在这里打印文件时长、码率等信息
-    std::cout << "时长: " << fmtCtx->duration / AV_TIME_BASE << " 秒" << std::endl;
+    LOGD("file duration: %ds", fmtCtx->duration / AV_TIME_BASE);
 
     // 4. 使用完毕后，关闭文件并释放资源
     avformat_close_input(&fmtCtx);
