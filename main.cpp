@@ -42,9 +42,25 @@ int main(void)
     LOGD("file duration: %ds", fmtCtx->duration / AV_TIME_BASE);
 
 
+    int video_stream_index = -1;
+    int audio_stream_index = -1;
+    int subtitle_stream_index = -1;
     for (unsigned int i = 0; i < fmtCtx->nb_streams; i++) { 
         AVStream* stream = fmtCtx->streams[i];
         LOGD("stream index: %d, codec_type: %d, codec_id: %d", i, stream->codecpar->codec_type, stream->codecpar->codec_id);
+        if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+        {
+            video_stream_index = i;
+        }else if(stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+        {
+            audio_stream_index = i;
+        }else if(stream->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
+        {
+            subtitle_stream_index = i;
+
+        }
+
+
         // nb_frames
         LOGD("nb_frames: %d", stream->nb_frames);
         // AVCodecParameters
@@ -59,6 +75,25 @@ int main(void)
         // stream->attached_pic;
         LOGD("attached_pic: %p, size=%d", stream->attached_pic.data, stream->attached_pic.size);
     }
+
+    AVPacket *pkt = av_packet_alloc();
+    int count[3] = {0};
+    while( av_read_frame(fmtCtx, pkt) >= 0){
+        if(pkt->stream_index == video_stream_index)
+        {
+            LOGD("video packet: %d", count[0]++);
+        }else if (pkt->stream_index == audio_stream_index)
+        {
+            LOGD("audio packet: %d", count[1]++);
+        }else if (pkt->stream_index == subtitle_stream_index)
+        {
+            LOGD("subtitle packet: %d", count[2]++);
+        }else{
+            LOGD("other packet");
+        }
+        av_packet_unref(pkt); 
+    }
+    av_packet_free(&pkt);
 
     // 4. 使用完毕后，关闭文件并释放资源
     avformat_close_input(&fmtCtx);
