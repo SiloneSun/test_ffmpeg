@@ -41,6 +41,21 @@ int main(void)
     // 可以在这里打印文件时长、码率等信息
     LOGD("file duration: %ds", fmtCtx->duration / AV_TIME_BASE);
 
+
+    for (unsigned int i = 0; i < fmtCtx->nb_streams; i++) { 
+        AVStream* stream = fmtCtx->streams[i];
+        LOGD("stream index: %d, codec_type: %d, codec_id: %d", i, stream->codecpar->codec_type, stream->codecpar->codec_id);
+        // nb_frames
+        LOGD("nb_frames: %d", stream->nb_frames);
+        // AVCodecParameters
+        AVCodecParameters* codecpar = stream->codecpar;
+        // width height framerate
+        LOGD("width: %d, height: %d, framerate: %d/%d", codecpar->width, codecpar->height,
+            stream->avg_frame_rate.num, stream->avg_frame_rate.den);
+    }
+
+    
+
     // 4. 使用完毕后，关闭文件并释放资源
     avformat_close_input(&fmtCtx);
 
