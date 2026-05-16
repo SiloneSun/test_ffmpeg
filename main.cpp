@@ -9,15 +9,18 @@ extern "C" {
 
 #include <string>
 #include "t_log.h"
+#include <libavutil/log.h>
 
 
-int main(void)
+int main(int argc, char* argv[])
 {
     unsigned int version = avformat_version();
+    av_log_set_level(AV_LOG_ERROR);
     LOGD("FFmpeg avformat version: %d: %d.%d", (version >> 16) & 0xFF, (version >> 8) & 0xFF, version & 0xFF);
     // 打开mp4 文件
     AVFormatContext* fmtCtx = nullptr;
-    const char* filePath = "./res/test_zzz.mp4";
+    const char* filePath = (argc > 1) ? argv[1] : "./res/test_zzz.mp4";
+    LOGD("open file: %s", filePath);
 
     // 1. 分配 AVFormatContext 内存
     fmtCtx = avformat_alloc_context();
@@ -126,11 +129,22 @@ int main(void)
     }
 
     AVPacket *pkt = av_packet_alloc();
-    int count[3] = {0};
+    int m_width = 0;
+    int m_height = 0;
+    int video_pkt_count = 0;
+    int keyframe_count = 0;
+    int non_keyframe_count = 0;
     while( av_read_frame(fmtCtx, pkt) >= 0){
         if(pkt->stream_index == video_stream_index)
         {
-            LOGD("video packet: %d", count[0]++);
+            video_pkt_count++;
+
+            // 统计关键帧和非关键帧
+            if (pkt->flags & AV_PKT_FLAG_KEY) {
+                keyframe_count++;
+            } else {
+                non_keyframe_count++;
+            }
 
             // 将 packet 发送给解码器
             if (avcodec_send_packet(decCtx, pkt) < 0) {
@@ -142,24 +156,29 @@ int main(void)
             // 从解码器接收解码后的 frame
             int ret = avcodec_receive_frame(decCtx, frame);
             if (ret == 0) {
-                // 解码成功，打印宽高
-                LOGD("decoded frame: width=%d, height=%d", frame->width, frame->height);
+                // 打印宽高
+                if ( m_width != frame->width || m_height != frame->height)
+                {
+                    LOGD("decoded frame: width=%d, height=%d", frame->width, frame->height);
+                    m_width = frame->width;
+                    m_height = frame->height;
+                }
             } else if (ret == AVERROR(EAGAIN)) {
                 // 需要更多数据才能解码出一帧，这是正常情况
-                LOGD("decode need more data");
+                // LOGD("decode need more data");
             } else {
                 char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
                 av_strerror(ret, errbuf, sizeof(errbuf));
-                LOGD("avcodec_receive_frame failed: %s", errbuf);
+                // LOGD("avcodec_receive_frame failed: %s", errbuf);
             }
         }else if (pkt->stream_index == audio_stream_index)
         {
-            LOGD("audio packet: %d", count[1]++);
+            // audio packet
         }else if (pkt->stream_index == subtitle_stream_index)
         {
-            LOGD("subtitle packet: %d", count[2]++);
+            // subtitle packet
         }else{
-            LOGD("other packet");
+            // LOGD("other packet");
         }
 
         av_packet_unref(pkt); 
@@ -172,6 +191,12 @@ int main(void)
             LOGD("flush decoded frame: width=%d, height=%d", frame->width, frame->height);
         }
     }
+
+    // 打印统计信息
+    LOGD("========== video packet statistics ==========");
+    LOGD("total video packets: %d", video_pkt_count);
+    LOGD("  -> keyframe:     %d", keyframe_count);
+    LOGD("  -> non-keyframe: %d", non_keyframe_count);
 
     av_packet_free(&pkt);
     av_frame_free(&frame);
