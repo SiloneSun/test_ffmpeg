@@ -3,6 +3,8 @@
 extern "C" {
     // 因为 FFmpeg 是用 C 语言编写的，所以在 C++ 中包含 FFmpeg 的头文件时，需要使用 extern "C" 来告诉编译器按照 C 的方式来链接这些函数。
 #include "avformat.h"
+#include "libavcodec/avcodec.h"
+#include "libavutil/frame.h"
 }
 
 #include <string>
@@ -76,12 +78,80 @@ int main(void)
         LOGD("attached_pic: %p, size=%d", stream->attached_pic.data, stream->attached_pic.size);
     }
 
+    // ========== 初始化视频解码器 ==========
+    AVCodecContext *decCtx = nullptr;
+    AVFrame *frame = nullptr;
+    if (video_stream_index >= 0) {
+        // 根据 codec_id 查找解码器
+        const AVCodec *decoder = avcodec_find_decoder(fmtCtx->streams[video_stream_index]->codecpar->codec_id);
+        if (!decoder) {
+            LOGD("avcodec_find_decoder failed");
+            avformat_close_input(&fmtCtx);
+            return -1;
+        }
+        LOGD("find decoder: %s", decoder->name);
+
+        // 分配解码器上下文
+        decCtx = avcodec_alloc_context3(decoder);
+        if (!decCtx) {
+            LOGD("avcodec_alloc_context3 failed");
+            avformat_close_input(&fmtCtx);
+            return -1;
+        }
+
+        // 将 codecpar 参数复制到解码器上下文
+        if (avcodec_parameters_to_context(decCtx, fmtCtx->streams[video_stream_index]->codecpar) < 0) {
+            LOGD("avcodec_parameters_to_context failed");
+            avcodec_free_context(&decCtx);
+            avformat_close_input(&fmtCtx);
+            return -1;
+        }
+
+        // 打开解码器
+        if (avcodec_open2(decCtx, decoder, nullptr) < 0) {
+            LOGD("avcodec_open2 failed");
+            avcodec_free_context(&decCtx);
+            avformat_close_input(&fmtCtx);
+            return -1;
+        }
+
+        // 分配 AVFrame 用于存储解码后的数据
+        frame = av_frame_alloc();
+        if (!frame) {
+            LOGD("av_frame_alloc failed");
+            avcodec_free_context(&decCtx);
+            avformat_close_input(&fmtCtx);
+            return -1;
+        }
+    }
+
     AVPacket *pkt = av_packet_alloc();
     int count[3] = {0};
     while( av_read_frame(fmtCtx, pkt) >= 0){
         if(pkt->stream_index == video_stream_index)
         {
             LOGD("video packet: %d", count[0]++);
+
+            // 将 packet 发送给解码器
+            if (avcodec_send_packet(decCtx, pkt) < 0) {
+                LOGD("avcodec_send_packet failed");
+                av_packet_unref(pkt);
+                continue;
+            }
+
+            // 从解码器接收解码后的 frame
+            int ret = avcodec_receive_frame(decCtx, frame);
+            if (ret == 0) {
+                // 解码成功，打印宽高
+                LOGD("decoded frame: width=%d, height=%d", frame->width, frame->height);
+            } else if (ret == AVERROR(EAGAIN)) {
+                // 需要更多数据才能解码出一帧，这是正常情况
+                LOGD("decode need more data");
+            } else {
+                char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
+                av_strerror(ret, errbuf, sizeof(errbuf));
+                LOGD("avcodec_receive_frame failed: %s", errbuf);
+            }
         }else if (pkt->stream_index == audio_stream_index)
         {
             LOGD("audio packet: %d", count[1]++);
@@ -91,9 +161,21 @@ int main(void)
         }else{
             LOGD("other packet");
         }
+
         av_packet_unref(pkt); 
     }
+
+    // 冲刷解码器：发送 NULL 让解码器输出缓冲的剩余帧
+    if (decCtx) {
+        avcodec_send_packet(decCtx, nullptr);
+        while (avcodec_receive_frame(decCtx, frame) == 0) {
+            LOGD("flush decoded frame: width=%d, height=%d", frame->width, frame->height);
+        }
+    }
+
     av_packet_free(&pkt);
+    av_frame_free(&frame);
+    avcodec_free_context(&decCtx);
 
     // 4. 使用完毕后，关闭文件并释放资源
     avformat_close_input(&fmtCtx);
