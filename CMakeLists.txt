@@ -14,6 +14,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # 递归收集 src/ 目录下所有 .c 和 .cpp 文件
 file(GLOB_RECURSE SOURCES
     main.cpp
+    json11.cpp
     src/*.c
     src/*.cpp
 )
