@@ -231,7 +231,7 @@ int main(int argc, char* argv[])
     LOGD("FFmpeg avformat version: %d: %d.%d", (version >> 16) & 0xFF, (version >> 8) & 0xFF, version & 0xFF);
     // 打开mp4 文件
     AVFormatContext* fmtCtx = nullptr;
-    const char* filePath = (argc > 1) ? argv[1] : "./res/test_zzz.mp4";
+    const char* filePath = (argc > 1) ? argv[1] : "./res/Video_19700101_003613642_thumb.mp4";
     LOGD("open file: %s", filePath);
 
     // 1. 分配 AVFormatContext 内存
@@ -303,7 +303,9 @@ int main(int argc, char* argv[])
 
     // ========== 初始化视频解码器 ==========
     AVCodecContext *decCtx = nullptr;
+    AVCodecContext* audio_dec_ctx = nullptr;
     AVFrame *frame = nullptr;
+    AVFrame *audio_frame = nullptr;
     if (video_stream_index >= 0) {
         // 根据 codec_id 查找解码器
         const AVCodec *decoder = avcodec_find_decoder(fmtCtx->streams[video_stream_index]->codecpar->codec_id);
@@ -348,10 +350,55 @@ int main(int argc, char* argv[])
         }
     }
 
+    if(audio_stream_index >= 0)
+    {
+        const AVCodec *decoder = avcodec_find_decoder(fmtCtx->streams[audio_stream_index]->codecpar->codec_id);
+        if (!decoder) {
+            LOGD("avcodec_find_decoder failed");
+            avformat_close_input(&fmtCtx);
+            return -1;
+        }
+        LOGD("find decoder: %s", decoder->name);
+
+        // 分配解码器上下文 
+        audio_dec_ctx = avcodec_alloc_context3(decoder);
+        if (!audio_dec_ctx) {
+            LOGD("avcodec_alloc_context3 failed");
+            avformat_close_input(&fmtCtx);
+            return -1;
+        }
+
+        // 将 codecpar 参数复制到解码器上下文
+        if (avcodec_parameters_to_context(audio_dec_ctx, fmtCtx->streams[audio_stream_index]->codecpar) < 0) {
+            LOGD("avcodec_parameters_to_context failed");
+            avcodec_free_context(&audio_dec_ctx);
+            avformat_close_input(&fmtCtx);
+            return -1;
+        }
+
+        // 打开解码器
+        if (avcodec_open2(audio_dec_ctx, decoder, nullptr) < 0) {
+            LOGD("avcodec_open2 failed");
+            avcodec_free_context(&audio_dec_ctx);
+            avformat_close_input(&fmtCtx);
+            return -1;
+        }
+
+        // 分配 AVFrame 用于存储解码后的数据
+        audio_frame = av_frame_alloc();
+        if (!audio_frame) {
+            LOGD("av_frame_alloc failed");
+            avcodec_free_context(&audio_dec_ctx);
+            avformat_close_input(&fmtCtx);
+            return -1;
+        }
+    }
+
     AVPacket *pkt = av_packet_alloc();
     int m_width = 0;
     int m_height = 0;
     int video_pkt_count = 0;
+    int audio_pkt_count = 0;
     int keyframe_count = 0;
     int non_keyframe_count = 0;
     while( av_read_frame(fmtCtx, pkt) >= 0){
@@ -375,14 +422,16 @@ int main(int argc, char* argv[])
 
             // 从解码器接收解码后的 frame
             int ret = avcodec_receive_frame(decCtx, frame);
-            if (ret == 0) {
+            if (ret == 0)
+            {
                 // 打印宽高
                 if ( m_width != frame->width || m_height != frame->height)
                 {
-                    LOGD("decoded frame: width=%d, height=%d", frame->width, frame->height);
+                    LOGD("decoded frame: width=%d, height=%d, format=%d", frame->width, frame->height, frame->format);
                     m_width = frame->width;
                     m_height = frame->height;
                 }
+                LOGD("test decoded frame: width=%d, height=%d, format=%d", frame->width, frame->height, frame->format);
             } else if (ret == AVERROR(EAGAIN)) {
                 // 需要更多数据才能解码出一帧，这是正常情况
                 // LOGD("decode need more data");
@@ -394,21 +443,54 @@ int main(int argc, char* argv[])
         }else if (pkt->stream_index == audio_stream_index)
         {
             // audio packet
+            // LOGD("audio packet");
+            audio_pkt_count++;
+            if (avcodec_send_packet(audio_dec_ctx, pkt) < 0) {
+                LOGD("avcodec_send_packet failed");
+                av_packet_unref(pkt);
+                continue;
+            }
+            // 从解码器接收解码后的 frame
+            int ret = avcodec_receive_frame(audio_dec_ctx, audio_frame);
+            if (ret == 0)
+            {
+                LOGD("decode audio frame: format=%d, sample_rate=%d, nb_samples=%d, channels=%d",
+                     audio_frame->format, audio_frame->sample_rate,
+                     audio_frame->nb_samples, audio_frame->ch_layout.nb_channels);
+            } else if (ret == AVERROR(EAGAIN)) {
+                // 需要更多数据才能解码出一帧，这是正常情况
+                // LOGD("decode need more data");
+            } else {
+                char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
+                av_strerror(ret, errbuf, sizeof(errbuf));
+            }
+
+
         }else if (pkt->stream_index == subtitle_stream_index)
         {
             // subtitle packet
+            // LOGD("subtitle packet");
         }else{
-            // LOGD("other packet");
+            LOGD("other packet");
         }
 
         av_packet_unref(pkt); 
     }
 
-    // 冲刷解码器：发送 NULL 让解码器输出缓冲的剩余帧
+    // 冲刷视频解码器：发送 NULL 让解码器输出缓冲的剩余帧
     if (decCtx) {
         avcodec_send_packet(decCtx, nullptr);
         while (avcodec_receive_frame(decCtx, frame) == 0) {
             LOGD("flush decoded frame: width=%d, height=%d", frame->width, frame->height);
+        }
+    }
+
+    // 冲刷音频解码器
+    if (audio_dec_ctx) {
+        avcodec_send_packet(audio_dec_ctx, nullptr);
+        while (avcodec_receive_frame(audio_dec_ctx, audio_frame) == 0) {
+            LOGD("flush audio frame: format=%d, nb_samples=%d",
+                 audio_frame->format, audio_frame->nb_samples);
         }
     }
 
@@ -420,7 +502,9 @@ int main(int argc, char* argv[])
 
     av_packet_free(&pkt);
     av_frame_free(&frame);
+    av_frame_free(&audio_frame);
     avcodec_free_context(&decCtx);
+    avcodec_free_context(&audio_dec_ctx);
 
     // 4. 使用完毕后，关闭文件并释放资源
     avformat_close_input(&fmtCtx);
