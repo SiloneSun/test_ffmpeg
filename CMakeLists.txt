@@ -17,6 +17,7 @@ file(GLOB_RECURSE SOURCES
     json11.cpp
     src/*.c
     src/*.cpp
+    xilong/*.cpp
 )
 
 # ============================================
@@ -25,6 +26,7 @@ file(GLOB_RECURSE SOURCES
 # 指定头文件搜索路径
 include_directories(
     include
+    xilong
     /home/sunxilong/work/mycode/ffmpeg-snapshot-git/my_build/include
     /home/sunxilong/work/mycode/ffmpeg-snapshot-git/my_build/include/libavformat
 )
