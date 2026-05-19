@@ -9,6 +9,13 @@ set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ============================================
+# SDL2 + SDL2_ttf 查找
+# ============================================
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(SDL2 REQUIRED sdl2)
+pkg_check_modules(SDL2_TTF REQUIRED SDL2_ttf)
+
+# ============================================
 # 源文件目录（所有 .c/.cpp 文件自动参与编译）
 # ============================================
 # 递归收集 src/ 目录下所有 .c 和 .cpp 文件
@@ -29,6 +36,8 @@ include_directories(
     xilong
     /home/sunxilong/work/mycode/ffmpeg-snapshot-git/my_build/include
     /home/sunxilong/work/mycode/ffmpeg-snapshot-git/my_build/include/libavformat
+    ${SDL2_INCLUDE_DIRS}
+    ${SDL2_TTF_INCLUDE_DIRS}
 )
 
 # ============================================
@@ -62,6 +71,8 @@ add_executable(my_test ${SOURCES})
 #   - INTERFACE: 仅依赖当前目标的目标链接，当前目标不链接
 #  我的备注：  当链接器处理 avformat（它依赖 avcodec 和 avutil）时，它发现缺符号，它会往后找。如果你的 avcodec 和 avutil 放在了 avformat 前面（或者顺序混乱），链接器在处理 avformat 时可能已经“路过”了 avutil，导致它认为那些符号不需要，或者在处理 avcodec 时还没看到 avutil。 所以顺序上必须 按照下面顺序：
 target_link_libraries(my_test PRIVATE
+    ${SDL2_LIBRARIES}
+    ${SDL2_TTF_LIBRARIES}
     # --- 链接 ffmpeg 的核心库 ---
     avdevice            # -lavdevice  （设备库）
     avfilter            # -lavfilter  （滤镜库）
