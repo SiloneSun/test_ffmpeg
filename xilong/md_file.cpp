@@ -10,6 +10,8 @@
 extern "C" {
 #include <libavutil/pixdesc.h>  // /home/sunxilong/work/mycode/ffmpeg-snapshot-git/ffmpeg/libavutil/pixdesc.c
 #include <libavutil/mathematics.h>
+#include <libavutil/imgutils.h> // av_image_alloc / av_image_fill_arrays
+#include <libswscale/swscale.h> // sws_getContext / sws_scale
 #include <SDL2/SDL.h>           // SDL 窗口/渲染
 #include <SDL2/SDL_ttf.h>       // SDL 字体渲染
 }
@@ -137,6 +139,64 @@ std::int16_t md_file::close_file()
     return 0;
 }
 
+// 辅助函数：将 RGB24 数据保存为 BMP 文件
+// BMP格式：文件头(14) + DIB头(40) + 像素数据(从下到上, BGR排列)
+static void save_rgb_to_bmp(const char *filename,
+                            const uint8_t *rgb_data, int w, int h)
+{
+    int row_size = (w * 3 + 3) & ~3;  // 每行对齐到4字节
+    int data_size = row_size * h;
+    int file_size = 14 + 40 + data_size;
+
+    FILE *f = fopen(filename, "wb");
+    if (!f) return;
+
+    // BMP file header (14 bytes)
+    uint8_t header[14] = {
+        'B', 'M',
+        (uint8_t)(file_size), (uint8_t)(file_size>>8),
+        (uint8_t)(file_size>>16), (uint8_t)(file_size>>24),
+        0,0, 0,0,
+        14+40,0,0,0
+    };
+    fwrite(header, 1, 14, f);
+
+    // DIB header (40 bytes)
+    uint8_t dib[40] = {
+        40,0,0,0,
+        (uint8_t)w, (uint8_t)(w>>8), (uint8_t)(w>>16), (uint8_t)(w>>24),
+        (uint8_t)h, (uint8_t)(h>>8), (uint8_t)(h>>16), (uint8_t)(h>>24),
+        1,0,
+        24,0,
+        0,0,0,0,
+        0,0,0,0,
+        0,0,0,0,
+        0,0,0,0,
+        0,0,0,0,
+        0,0,0,0
+    };
+    fwrite(dib, 1, 40, f);
+
+    // 像素数据（BMP 是 BGR 从下到上）
+    for (int y = h - 1; y >= 0; y--) {
+        const uint8_t *row = rgb_data + y * w * 3;
+        for (int x = 0; x < w; x++) {
+            uint8_t r = row[x * 3 + 0];
+            uint8_t g = row[x * 3 + 1];
+            uint8_t b = row[x * 3 + 2];
+            fputc(b, f);  // B
+            fputc(g, f);  // G
+            fputc(r, f);  // R
+        }
+        // 补齐对齐字节
+        for (int p = w * 3; p < row_size; p++) {
+            fputc(0, f);
+        }
+    }
+    fclose(f);
+    LOGD("snapshot saved: %s (%dx%d)", filename, w, h);
+}
+
 // 辅助函数：在 SDL 渲染器上渲染一行文字（x,y 为左上角坐标，返回下一行 y 坐标）
 static int render_text_line(SDL_Renderer *ren, TTF_Font *font, int x, int y,
                             const char *text, SDL_Color color)
@@ -221,11 +281,13 @@ std::int16_t md_file::play()
     const char *codec_name = video_codec ? video_codec->name : "unknown";
 
     // ============================================================
-    // 2. 初始化 SDL + TTF
+    // 2. 初始化 SDL + TTF（窗口尺寸基于缩放后的分辨率）
     // ============================================================
+    const int OUT_W = 1280;
+    const int OUT_H = 720;
     const int PANEL_W = 320;
-    int win_w = vid_w + PANEL_W;
-    int win_h = (vid_h > 480) ? vid_h : 480;
+    int win_w = OUT_W + PANEL_W;
+    int win_h = (OUT_H > 480) ? OUT_H : 480;
 
     SDL_Window   *sdl_win   = nullptr;
     SDL_Renderer *sdl_ren   = nullptr;
@@ -263,7 +325,7 @@ std::int16_t md_file::play()
                     sdl_tex = SDL_CreateTexture(sdl_ren,
                                                 SDL_PIXELFORMAT_IYUV,
                                                 SDL_TEXTUREACCESS_STREAMING,
-                                                vid_w, vid_h);
+                                                OUT_W, OUT_H);
                     if (!sdl_tex) {
                         LOGD("SDL_CreateTexture failed: %s", SDL_GetError());
                         SDL_DestroyRenderer(sdl_ren); SDL_DestroyWindow(sdl_win);
@@ -288,6 +350,34 @@ std::int16_t md_file::play()
     int m_height = 0;
     uint32_t last_ticks = SDL_GetTicks();
     bool quit = false;
+
+    // ============================================================
+    // 4. 初始化 swscale：将解码帧缩放到 1280x720 YUV420P（用于显示）
+    // ============================================================
+    // sws：YUV420P → YUV420P 缩放（用于 SDL 显示）
+    struct SwsContext *sws_ctx = sws_getContext(
+        vid_w, vid_h, AV_PIX_FMT_YUV420P,     // 源：原始尺寸 YUV420P
+        OUT_W,  OUT_H,  AV_PIX_FMT_YUV420P,    // 目标：1280x720 YUV420P
+        SWS_BILINEAR, NULL, NULL, NULL);
+    if (!sws_ctx) {
+        LOGD("sws_getContext failed");
+    }
+
+    // 为缩放的 YUV420P 帧分配内存（用于 SDL 显示）
+    uint8_t *scale_yuv_data[4] = {NULL};
+    int      scale_yuv_linesize[4] = {0};
+    av_image_alloc(scale_yuv_data, scale_yuv_linesize,
+                   OUT_W, OUT_H, AV_PIX_FMT_YUV420P, 1);
+
+    // sws：YUV420P → RGB24（用于 BMP 保存）
+    struct SwsContext *sws_rgb_ctx = sws_getContext(
+        vid_w, vid_h, AV_PIX_FMT_YUV420P,
+        OUT_W,  OUT_H,  AV_PIX_FMT_RGB24,
+        SWS_BILINEAR, NULL, NULL, NULL);
+    uint8_t *scale_rgb_data[4] = {NULL};
+    int      scale_rgb_linesize[4] = {0};
+    av_image_alloc(scale_rgb_data, scale_rgb_linesize,
+                   OUT_W, OUT_H, AV_PIX_FMT_RGB24, 1);
 
     // 统计用
     uint32_t fps_frame_count = 0;
@@ -369,6 +459,29 @@ std::int16_t md_file::play()
                     m_height = frame->height;
                 }
 
+                // --- 使用 sws_scale 将解码帧缩放到 1280x720 YUV420P（用于显示） ---
+                if (sws_ctx && scale_yuv_data[0]) {
+                    sws_scale(sws_ctx,
+                              frame->data, frame->linesize,   // 源 YUV420P
+                              0, vid_h,
+                              scale_yuv_data, scale_yuv_linesize);  // 目标 YUV420P
+                }
+
+                // --- 缩放到 RGB24（用于 BMP 保存，仅第一帧） ---
+                if (sws_rgb_ctx && scale_rgb_data[0]) {
+                    sws_scale(sws_rgb_ctx,
+                              frame->data, frame->linesize,
+                              0, vid_h,
+                              scale_rgb_data, scale_rgb_linesize);
+                    static int snap_count = 0;
+                    if (snap_count == 0) {
+                        char fname[64];
+                        snprintf(fname, sizeof(fname), "snap_%03d.bmp", snap_count);
+                        save_rgb_to_bmp(fname, scale_rgb_data[0], OUT_W, OUT_H);
+                        snap_count++;
+                    }
+                }
+
                 // --- 帧率 & 码率统计（每秒更新一次） ---
                 fps_frame_count++;
                 uint32_t now_tick = SDL_GetTicks();
@@ -395,33 +508,22 @@ std::int16_t md_file::play()
                     }
                     last_ticks = SDL_GetTicks();
 
-                    // 渲染左半：视频画面
+                    // 渲染左半：缩放后的视频画面（1280x720 铺满左侧区域）
                     SDL_UpdateYUVTexture(sdl_tex, NULL,
-                                         frame->data[0], frame->linesize[0],
-                                         frame->data[1], frame->linesize[1],
-                                         frame->data[2], frame->linesize[2]);
+                                         scale_yuv_data[0], scale_yuv_linesize[0],
+                                         scale_yuv_data[1], scale_yuv_linesize[1],
+                                         scale_yuv_data[2], scale_yuv_linesize[2]);
 
                     // 清空整个窗口为黑色
                     SDL_SetRenderDrawColor(sdl_ren, 0, 0, 0, 255);
                     SDL_RenderClear(sdl_ren);
 
-                    // 左边渲染视频（保持比例，居中显示在左侧区域）
-                    SDL_Rect vid_rect;
-                    double scale = (double)vid_h / win_h;
-                    int draw_w = vid_w / scale;
-                    int draw_h = win_h;
-                    if (draw_w > vid_w) {
-                        draw_w = vid_w;
-                        draw_h = vid_h;
-                    }
-                    vid_rect.x = 0;
-                    vid_rect.y = (win_h - draw_h) / 2;
-                    vid_rect.w = draw_w < vid_w ? draw_w : vid_w;
-                    vid_rect.h = draw_h;
+                    // 左边渲染缩放后的视频（铺满左侧区域）
+                    SDL_Rect vid_rect = { 0, 0, OUT_W, OUT_H };
                     SDL_RenderCopy(sdl_ren, sdl_tex, NULL, &vid_rect);
 
                     // 右边：统计面板（深色背景）
-                    SDL_Rect panel_rect = { vid_w, 0, win_w - vid_w, win_h };
+                    SDL_Rect panel_rect = { OUT_W, 0, win_w - OUT_W, win_h };
                     SDL_SetRenderDrawColor(sdl_ren, 30, 30, 40, 255);
                     SDL_RenderFillRect(sdl_ren, &panel_rect);
 
@@ -434,7 +536,7 @@ std::int16_t md_file::play()
                     SDL_Color yellow = { 255, 220, 80,  255 };
                     SDL_Color green  = { 100, 255, 100, 255 };
 
-                    int px = vid_w + 10;  // 面板左边缘
+                    int px = OUT_W + 10;  // 面板左边缘
                     int py = 10;
 
                     py = render_text_line(sdl_ren, sdl_font, px, py,
@@ -446,7 +548,7 @@ std::int16_t md_file::play()
                     }
                     {
                         char buf[256];
-                        snprintf(buf, sizeof(buf), "Size: %dx%d", vid_w, vid_h);
+                        snprintf(buf, sizeof(buf), "Size(src): %dx%d", vid_w, vid_h);
                         py = render_text_line(sdl_ren, sdl_font, px, py, buf, white);
                     }
                     {
@@ -497,7 +599,6 @@ std::int16_t md_file::play()
                     }
                     {
                         char buf[128];
-                        // 视频流的平均码率（来自文件头信息）
                         int64_t file_bitrate = m_fmtCtx->bit_rate;
                         if (file_bitrate > 0) {
                             snprintf(buf, sizeof(buf), "Bitrate(file): %.0f kbps",
@@ -523,6 +624,12 @@ std::int16_t md_file::play()
                         snprintf(buf, sizeof(buf), "Total bytes: %lld",
                                  (long long)total_bytes);
                         py = render_text_line(sdl_ren, sdl_font, px, py, buf, white);
+                    }
+                    {
+                        // 显示缩放输出信息
+                        char buf[128];
+                        snprintf(buf, sizeof(buf), "Scale out: %dx%d", OUT_W, OUT_H);
+                        py = render_text_line(sdl_ren, sdl_font, px, py, buf, green);
                     }
 
                     SDL_RenderPresent(sdl_ren);
@@ -574,8 +681,13 @@ std::int16_t md_file::play()
     }
 
     // ============================================================
-    // 5. 清理 SDL
+    // 5. 清理 swscale & SDL
     // ============================================================
+    if (sws_ctx) sws_freeContext(sws_ctx);
+    if (sws_rgb_ctx) sws_freeContext(sws_rgb_ctx);
+    if (scale_yuv_data[0]) av_freep(&scale_yuv_data[0]);
+    if (scale_rgb_data[0]) av_freep(&scale_rgb_data[0]);
+
     if (sdl_tex) SDL_DestroyTexture(sdl_tex);
     if (sdl_ren) SDL_DestroyRenderer(sdl_ren);
     if (sdl_win) SDL_DestroyWindow(sdl_win);
