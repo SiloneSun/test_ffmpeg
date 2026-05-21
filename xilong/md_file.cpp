@@ -11,8 +11,10 @@ extern "C" {
 #include <libavutil/pixdesc.h>  // /home/sunxilong/work/mycode/ffmpeg-snapshot-git/ffmpeg/libavutil/pixdesc.c
 #include <libavutil/mathematics.h>
 #include <libavutil/imgutils.h> // av_image_alloc / av_image_fill_arrays
+#include <libavutil/opt.h>      // av_opt_set_*
 #include <libswscale/swscale.h> // sws_getContext / sws_scale
-#include <SDL2/SDL.h>           // SDL 窗口/渲染
+#include <libswresample/swresample.h> // swr_alloc_set_opts2 / swr_convert
+#include <SDL2/SDL.h>           // SDL 窗口/渲染/音频
 #include <SDL2/SDL_ttf.h>       // SDL 字体渲染
 }
 
@@ -242,6 +244,25 @@ std::int16_t md_file::play()
         }
     }
 
+    // ============================================================
+    // 先初始化 SDL 视频+音频子系统（后面的视频初始化 + 音频设备打开都需要它）
+    // ============================================================
+    bool sdl_audio_ok = false;
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) {
+        LOGD("SDL_Init failed: %s", SDL_GetError());
+    } else {
+        sdl_audio_ok = true;
+    }
+
+    // ============================================================
+    // 音频解码器 + 重采样 + SDL 音频设备初始化
+    // ============================================================
+    SwrContext *swr_ctx = nullptr;
+    SDL_AudioDeviceID audio_dev_id = 0;
+    int audio_dst_sample_rate = 0;
+    int audio_dst_channels = 0;
+    AVSampleFormat audio_dst_fmt = AV_SAMPLE_FMT_S16;
+
     if (audio_stream_index >= 0) {
         const AVCodec *decoder = avcodec_find_decoder(m_fmtCtx->streams[audio_stream_index]->codecpar->codec_id);
         if (!decoder) {
@@ -258,6 +279,66 @@ std::int16_t md_file::play()
         if (avcodec_open2(audio_dec_ctx.get(), decoder, nullptr) < 0) {
             LOGD("avcodec_open2 failed");
             return -1;
+        }
+
+        // --- 获取音频解码参数 ---
+        AVSampleFormat src_fmt = audio_dec_ctx->sample_fmt;
+        int src_sr = audio_dec_ctx->sample_rate;
+        AVChannelLayout *src_ch_layout = &audio_dec_ctx->ch_layout;
+
+        LOGD("audio: fmt=%d, sr=%d, ch=%d",
+             src_fmt, src_sr, src_ch_layout->nb_channels);
+
+        // 目标格式：16-bit signed interleaved，采样率保持不变
+        audio_dst_sample_rate = src_sr;
+        audio_dst_channels = src_ch_layout->nb_channels;
+
+        AVChannelLayout dst_ch_layout;
+        av_channel_layout_default(&dst_ch_layout, audio_dst_channels);
+
+        // --- 初始化重采样器 ---
+        swr_ctx = swr_alloc();
+        if (!swr_ctx) {
+            LOGD("swr_alloc failed");
+        } else {
+            av_opt_set_chlayout(swr_ctx, "in_chlayout",  src_ch_layout, 0);
+            av_opt_set_int(swr_ctx,        "in_sample_rate",  src_sr,        0);
+            av_opt_set_sample_fmt(swr_ctx, "in_sample_fmt",   src_fmt,       0);
+            av_opt_set_chlayout(swr_ctx, "out_chlayout", &dst_ch_layout, 0);
+            av_opt_set_int(swr_ctx,        "out_sample_rate", audio_dst_sample_rate, 0);
+            av_opt_set_sample_fmt(swr_ctx, "out_sample_fmt",  audio_dst_fmt, 0);
+            if (swr_init(swr_ctx) < 0) {
+                LOGD("swr_init failed");
+                swr_free(&swr_ctx);
+                swr_ctx = nullptr;
+            } else {
+                LOGD("swr_init ok: in=%d/%d/%d → out=%d/%d/%d",
+                     src_fmt, src_sr, src_ch_layout->nb_channels,
+                     audio_dst_fmt, audio_dst_sample_rate, audio_dst_channels);
+            }
+        }
+
+        // --- 打开 SDL 音频设备（使用 SDL_QueueAudio 推送数据，不需要回调） ---
+        if (sdl_audio_ok) {
+            SDL_AudioSpec desired, obtained;
+            SDL_zero(desired);
+            desired.freq     = audio_dst_sample_rate;
+            desired.format   = AUDIO_S16SYS;
+            desired.channels = audio_dst_channels;
+            desired.samples  = 4096;   // SDL 内部缓冲区大小
+            desired.callback = NULL;   // 不使用回调，直接用 SDL_QueueAudio
+
+            audio_dev_id = SDL_OpenAudioDevice(NULL, 0, &desired, &obtained,
+                                               SDL_AUDIO_ALLOW_ANY_CHANGE);
+            if (audio_dev_id == 0) {
+                LOGD("SDL_OpenAudioDevice failed: %s", SDL_GetError());
+            } else {
+                LOGD("SDL audio device opened: freq=%d, fmt=%d, ch=%d",
+                     obtained.freq, obtained.format, obtained.channels);
+                SDL_PauseAudioDevice(audio_dev_id, 0); // 开始播放
+            }
+        } else {
+            LOGD("SDL audio subsystem not available, skip audio device open");
         }
     }
 
@@ -295,9 +376,7 @@ std::int16_t md_file::play()
     TTF_Font     *sdl_font  = nullptr;
     bool          sdl_ok    = false;
 
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
-        LOGD("SDL_Init failed: %s", SDL_GetError());
-    } else if (TTF_Init() < 0) {
+    if (TTF_Init() < 0) {
         LOGD("TTF_Init failed: %s", TTF_GetError());
         SDL_Quit();
     } else {
@@ -343,7 +422,7 @@ std::int16_t md_file::play()
     }
 
     // ============================================================
-    // 3. 解码主循环 + 显示
+    // 3. 解码主循环 + 显示 + 音频播放
     // ============================================================
     md_packet pkt;
     int m_width = 0;
@@ -651,7 +730,43 @@ std::int16_t md_file::play()
             }
             int ret = avcodec_receive_frame(audio_dec_ctx.get(), audio_frame.get());
             if (ret == 0) {
-                // 不打印音频帧信息，减少日志
+                // --- 将解码后的 PCM 重采样为 S16 并送入 SDL 音频队列播放 ---
+                if (swr_ctx && audio_dev_id > 0) {
+                    int dst_nb_samples = swr_get_out_samples(swr_ctx, audio_frame->nb_samples);
+                    if (dst_nb_samples > 0) {
+                        uint8_t *dst_data[8] = {NULL};
+                        int dst_linesize[8] = {0};
+                        int dst_buf_size = av_samples_alloc(dst_data, dst_linesize,
+                                                            audio_dst_channels,
+                                                            dst_nb_samples,
+                                                            audio_dst_fmt, 0);
+                        if (dst_data[0]) {
+                            const uint8_t *in_data[8];
+                            for (int i = 0; i < 8; i++) {
+                                in_data[i] = audio_frame->data[i];
+                            }
+                            int actual_samples = swr_convert(swr_ctx,
+                                                             (uint8_t**)dst_data, dst_nb_samples,
+                                                             in_data,
+                                                             audio_frame->nb_samples);
+                            if (actual_samples > 0) {
+                                int out_size = av_samples_get_buffer_size(dst_linesize,
+                                                                          audio_dst_channels,
+                                                                          actual_samples,
+                                                                          audio_dst_fmt, 0);
+                                if (out_size > 0) {
+                                    // 避免队列积压太多数据（超过 ~0.5 秒的数据量则等待）
+                                    int max_queued = audio_dst_sample_rate * audio_dst_channels * 2 / 2;
+                                    while (SDL_GetQueuedAudioSize(audio_dev_id) > (Uint32)max_queued) {
+                                        SDL_Delay(5);
+                                    }
+                                    SDL_QueueAudio(audio_dev_id, dst_data[0], out_size);
+                                }
+                            }
+                            av_freep(&dst_data[0]);
+                        }
+                    }
+                }
             } else if (ret == AVERROR(EAGAIN)) {
             } else {
                 char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
@@ -677,16 +792,59 @@ std::int16_t md_file::play()
     if (!quit && audio_stream_index >= 0) {
         avcodec_send_packet(audio_dec_ctx.get(), nullptr);
         while (avcodec_receive_frame(audio_dec_ctx.get(), audio_frame.get()) == 0) {
+            // 冲刷帧——也送到 SDL 播放
+            if (swr_ctx && audio_dev_id > 0) {
+                int dst_nb_samples = swr_get_out_samples(swr_ctx, audio_frame->nb_samples);
+                if (dst_nb_samples > 0) {
+                    uint8_t *dst_data = nullptr;
+                    int dst_buf_size = av_samples_alloc(&dst_data, NULL,
+                                                        audio_dst_channels,
+                                                        dst_nb_samples,
+                                                        audio_dst_fmt, 0);
+                    if (dst_data) {
+                        int actual_samples = swr_convert(swr_ctx, &dst_data, dst_nb_samples,
+                                                         (const uint8_t**)audio_frame->data,
+                                                         audio_frame->nb_samples);
+                        if (actual_samples > 0) {
+                            int out_size = av_samples_get_buffer_size(NULL,
+                                                                      audio_dst_channels,
+                                                                      actual_samples,
+                                                                      audio_dst_fmt, 0);
+                            if (out_size > 0) {
+                                SDL_QueueAudio(audio_dev_id, dst_data, out_size);
+                            }
+                        }
+                        av_freep(&dst_data);
+                    }
+                }
+            }
         }
     }
 
     // ============================================================
-    // 5. 清理 swscale & SDL
+    // 5. 等待音频播放完毕
+    // ============================================================
+    if (audio_dev_id > 0) {
+        // 等待直到音频队列耗尽，或超时 3 秒
+        uint32_t wait_start = SDL_GetTicks();
+        while (SDL_GetQueuedAudioSize(audio_dev_id) > 0) {
+            SDL_Delay(10);
+            if (SDL_GetTicks() - wait_start > 3000) break;
+        }
+    }
+
+    // ============================================================
+    // 6. 清理 swscale & SDL & swr & audio
     // ============================================================
     if (sws_ctx) sws_freeContext(sws_ctx);
     if (sws_rgb_ctx) sws_freeContext(sws_rgb_ctx);
     if (scale_yuv_data[0]) av_freep(&scale_yuv_data[0]);
     if (scale_rgb_data[0]) av_freep(&scale_rgb_data[0]);
+
+    if (audio_dev_id > 0) {
+        SDL_CloseAudioDevice(audio_dev_id);
+    }
+    if (swr_ctx) swr_free(&swr_ctx);
 
     if (sdl_tex) SDL_DestroyTexture(sdl_tex);
     if (sdl_ren) SDL_DestroyRenderer(sdl_ren);
