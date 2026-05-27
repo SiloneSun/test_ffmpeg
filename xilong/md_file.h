@@ -3,6 +3,8 @@
 
 #include <memory>
 #include <string>
+#include <mutex>
+#include <stdint.h>
 #include "md_ffmpeg.h"
 
 namespace sunxilong
@@ -22,6 +24,9 @@ namespace sunxilong
             bool end_of_file();
         protected:
         private:
+            // ── 时间戳记录 ──
+            void record_video_play_pts(int64_t pts_us, int64_t render_wall_us, uint32_t audio_dev_id);
+
             unsigned int m_ff_version;
             std::string m_file_name;
             md_format_ctx m_fmtCtx;
@@ -34,6 +39,20 @@ namespace sunxilong
             int audio_pkt_count = 0;
             int keyframe_count = 0;
             int non_keyframe_count = 0;
+
+            // 音视频时间戳（微秒）
+            std::mutex m_ts_mtx;
+            int64_t m_last_video_pts_us = AV_NOPTS_VALUE;
+
+            // 音频播放追踪
+            int64_t m_audio_source_pts_us = AV_NOPTS_VALUE;  // 最新推送音频帧的 PTS
+            uint64_t m_audio_total_pushed_bytes = 0;         // 推入 SDL 的总字节数
+            int m_audio_sr = 0;                              // 音频采样率（record_timestamp 需要）
+            int m_audio_channels = 0;                        // 音频声道数（record_timestamp 需要）
+
+            // 音视频同步时钟基准（用于将 PTS 对齐到墙钟时间域）
+            int64_t m_audio_clock_ref_wall = 0;              // 音频基准墙钟 (av_gettime_relative)
+            int64_t m_audio_clock_ref_pts = AV_NOPTS_VALUE;  // 音频基准 PTS
     };
 };
 
