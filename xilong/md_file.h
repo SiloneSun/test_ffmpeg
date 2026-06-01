@@ -20,7 +20,7 @@ namespace sunxilong
             std::int16_t deinit();
             std::int16_t open_file();
             std::int16_t close_file();
-            std::int16_t play();
+            std::int16_t play(bool loop = false);
             bool end_of_file();
         protected:
         private:

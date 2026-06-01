@@ -65,10 +65,10 @@ void md_file::record_video_play_pts(int64_t pts_us, int64_t render_wall_us, uint
         smoothed_diff = sum / FILTER_TAPS;
     }
 
-    LOGD("[sync] video-audio diff: %6ld us (%5.1f ms) smoothed=%6ld us (%5.1f ms) queue=%u bytes (%ld us) rw=%ld",
-         (long)av_diff, av_diff / 1000.0,
-         (long)smoothed_diff, smoothed_diff / 1000.0,
-         queued, (long)queued_us, (long)(render_wall_us / 1000));
+    // LOGD("[sync] video-audio diff: %6ld us (%5.1f ms) smoothed=%6ld us (%5.1f ms) queue=%u bytes (%ld us) rw=%ld",
+    //      (long)av_diff, av_diff / 1000.0,
+    //      (long)smoothed_diff, smoothed_diff / 1000.0,
+    //      queued, (long)queued_us, (long)(render_wall_us / 1000));
 }
 
 std::shared_ptr<md_file> md_file::get(std::string file_name)
@@ -228,7 +228,7 @@ static int render_text_line(SDL_Renderer *ren, TTF_Font *font, int x, int y,
     return y + h + 2;
 }
 
-std::int16_t md_file::play()
+std::int16_t md_file::play(bool loop)
 {
     md_codec_ctx decCtx;
     md_codec_ctx audio_dec_ctx;
@@ -392,14 +392,20 @@ std::int16_t md_file::play()
     while (!quit) {
         int read_ret = av_read_frame(m_fmtCtx.get(), pkt.get());
         if (read_ret < 0) {
-            LOGD("end of file, seek to beginning for loop play");
-            if (video_stream_index >= 0) avcodec_flush_buffers(decCtx.get());
-            if (audio_stream_index >= 0) avcodec_flush_buffers(audio_dec_ctx.get());
-            av_seek_frame(m_fmtCtx.get(), -1, 0, AVSEEK_FLAG_BACKWARD);
-            video_pkt_count = 0; audio_pkt_count = 0; keyframe_count = 0; non_keyframe_count = 0;
-            fps_frame_count = 0; fps_last_tick = SDL_GetTicks(); realtime_fps = 0.0;
-            av_packet_unref(pkt.get());
-            continue;
+            if(loop)
+            {
+                LOGD("end of file, seek to beginning for loop play");
+                if (video_stream_index >= 0) avcodec_flush_buffers(decCtx.get());
+                if (audio_stream_index >= 0) avcodec_flush_buffers(audio_dec_ctx.get());
+                av_seek_frame(m_fmtCtx.get(), -1, 0, AVSEEK_FLAG_BACKWARD);
+                video_pkt_count = 0; audio_pkt_count = 0; keyframe_count = 0; non_keyframe_count = 0;
+                fps_frame_count = 0; fps_last_tick = SDL_GetTicks(); realtime_fps = 0.0;
+                av_packet_unref(pkt.get());
+                continue;
+            }else{
+                break;
+            }
+
         }
 
         // 事件
@@ -425,6 +431,36 @@ std::int16_t md_file::play()
             if (ret == 0) {
                 if (m_width != frame->width || m_height != frame->height) {
                     m_width = frame->width; m_height = frame->height;
+                }
+                
+                // 显示帧类型
+                {
+                    switch (frame->pict_type) {
+                    case AV_PICTURE_TYPE_I: 
+                        LOGD("video_pkt_count %d I-frame", video_pkt_count);
+                        break;
+                    case AV_PICTURE_TYPE_P:
+                        LOGD("video_pkt_count %d P-frame", video_pkt_count);
+                        break;
+                    case AV_PICTURE_TYPE_B:
+                        LOGD("video_pkt_count %d B-frame", video_pkt_count);
+                        break;
+                    case AV_PICTURE_TYPE_S:
+                        LOGD("video_pkt_count %d S-frame", video_pkt_count);
+                        break;
+                    
+                    case AV_PICTURE_TYPE_SI:
+                        LOGD("video_pkt_count %d SI-frame", video_pkt_count);
+                        break;
+                    case AV_PICTURE_TYPE_SP:
+                        LOGD("video_pkt_count %d SP-frame", video_pkt_count);
+                        break;
+                    case AV_PICTURE_TYPE_BI:
+                        LOGD("video_pkt_count %d BI-frame", video_pkt_count);
+                        break;
+                    default:
+                        LOGD("video_pkt_count %d Unknown frame type", video_pkt_count);
+                    }
                 }
 
                 if (sws_ctx && scale_yuv_data[0])
