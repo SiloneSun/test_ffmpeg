@@ -4,6 +4,9 @@
 #include <iostream>
 #include <string>
 #include <ostream>
+#include <cstring>
+#include <utility>
+#include <vector>
 #include <libavutil/log.h>
 #include "utils.h"
 
@@ -141,7 +144,7 @@ std::int16_t md_file::open_file()
         const char* type_str = media_type_str(stream->codecpar->codec_type);
         const char* codec_name = avcodec_get_name(stream->codecpar->codec_id);
         LOGD("stream[%d]: %s (%s)", stream->index, type_str, codec_name);
-        LOGD("nb_frames: %d", stream->nb_frames);
+        LOGD("nb_frames: %lld", (long long)stream->nb_frames);
     }
 
     std::string json_output = build_streams_array(m_fmtCtx.get());
@@ -226,6 +229,47 @@ static int render_text_line(SDL_Renderer *ren, TTF_Font *font, int x, int y,
     int h = surf->h;
     SDL_FreeSurface(surf);
     return y + h + 2;
+}
+
+struct cached_video_frame {
+    std::vector<uint8_t> y;
+    std::vector<uint8_t> u;
+    std::vector<uint8_t> v;
+    int64_t pts_us = AV_NOPTS_VALUE;
+    int frame_no = 0;
+    std::string frame_type;
+    bool key_frame = false;
+};
+
+struct video_frame_index {
+    int frame_no = 0;
+    int64_t pts = AV_NOPTS_VALUE;
+    int64_t pts_us = AV_NOPTS_VALUE;
+    int64_t pkt_pos = -1;
+    std::string frame_type;
+    bool key_frame = false;
+};
+
+static const char *picture_type_str(AVPictureType pict_type, bool key_frame)
+{
+    switch (pict_type) {
+    case AV_PICTURE_TYPE_I:
+        return key_frame ? "IDR" : "I";
+    case AV_PICTURE_TYPE_P:
+        return "P";
+    case AV_PICTURE_TYPE_B:
+        return "B";
+    case AV_PICTURE_TYPE_S:
+        return "S";
+    case AV_PICTURE_TYPE_SI:
+        return "SI";
+    case AV_PICTURE_TYPE_SP:
+        return "SP";
+    case AV_PICTURE_TYPE_BI:
+        return "BI";
+    default:
+        return "?";
+    }
 }
 
 std::int16_t md_file::play(bool loop)
@@ -388,8 +432,351 @@ std::int16_t md_file::play(bool loop)
     bool quit = false;
     uint32_t fps_frame_count = 0, fps_last_tick = SDL_GetTicks();
     double realtime_fps = 0.0;
+    int decoded_video_frame_count = 0;
+    bool paused = false;
+    bool step_next_frame = false;
+    bool hold_prev_frame = false;
+    bool hold_next_frame = false;
+    uint32_t hold_next_tick = 0;
+    std::vector<cached_video_frame> frame_cache;
+    std::vector<video_frame_index> frame_index_list;
+    int frame_cache_start = 0;
+    int frame_cache_count = 0;
+    int frame_cache_index = -1;
+    const int MAX_CACHED_FRAMES = 45;
+    bool snapshot_saved = false;
+    const bool DEBUG_FRAME_LOGS = false;
+
+    frame_cache.resize(MAX_CACHED_FRAMES);
+
+    video_pkt_count = 0; audio_pkt_count = 0; keyframe_count = 0; non_keyframe_count = 0;
+
+    auto copy_plane = [](std::vector<uint8_t>& dst, const uint8_t *src, int src_linesize, int w, int h) {
+        dst.resize(w * h);
+        for (int y = 0; y < h; y++)
+            memcpy(dst.data() + y * w, src + y * src_linesize, w);
+    };
+
+    auto cache_ref = [&](int index) -> cached_video_frame& {
+        int pos = (frame_cache_start + index) % MAX_CACHED_FRAMES;
+        return frame_cache[pos];
+    };
+
+    auto cache_current_frame = [&](int64_t pts_us, int frame_no, const char *frame_type, bool key_frame) {
+        if (!scale_yuv_data[0])
+            return;
+
+        if (frame_cache_index + 1 < frame_cache_count)
+            frame_cache_count = frame_cache_index + 1;
+
+        int write_index = 0;
+        if (frame_cache_count < MAX_CACHED_FRAMES) {
+            write_index = (frame_cache_start + frame_cache_count) % MAX_CACHED_FRAMES;
+            frame_cache_count++;
+        } else {
+            write_index = frame_cache_start;
+            frame_cache_start = (frame_cache_start + 1) % MAX_CACHED_FRAMES;
+        }
+
+        cached_video_frame& cached = frame_cache[write_index];
+        copy_plane(cached.y, scale_yuv_data[0], scale_yuv_linesize[0], OUT_W, OUT_H);
+        copy_plane(cached.u, scale_yuv_data[1], scale_yuv_linesize[1], OUT_W / 2, OUT_H / 2);
+        copy_plane(cached.v, scale_yuv_data[2], scale_yuv_linesize[2], OUT_W / 2, OUT_H / 2);
+        cached.pts_us = pts_us;
+        cached.frame_no = frame_no;
+        cached.frame_type = frame_type;
+        cached.key_frame = key_frame;
+
+        frame_cache_index = frame_cache_count - 1;
+    };
+
+    auto find_index_by_frame_no = [&](int frame_no) -> video_frame_index* {
+        if (frame_no <= 0 || frame_no > (int)frame_index_list.size())
+            return nullptr;
+        if (frame_index_list[frame_no - 1].frame_no != frame_no)
+            return nullptr;
+        return &frame_index_list[frame_no - 1];
+    };
+
+    auto find_index_by_pts = [&](int64_t pts) -> video_frame_index* {
+        if (pts == AV_NOPTS_VALUE)
+            return nullptr;
+        for (auto& item : frame_index_list) {
+            if (item.pts == pts)
+                return &item;
+        }
+        return nullptr;
+    };
+
+    auto record_frame_index = [&](int frame_no, int64_t pts, int64_t pts_us,
+                                  int64_t pkt_pos, const char *frame_type,
+                                  bool key_frame) {
+        if (frame_no <= 0)
+            return;
+        if ((int)frame_index_list.size() < frame_no)
+            frame_index_list.resize(frame_no);
+
+        video_frame_index& item = frame_index_list[frame_no - 1];
+        item.frame_no = frame_no;
+        item.pts = pts;
+        item.pts_us = pts_us;
+        item.pkt_pos = pkt_pos;
+        item.frame_type = frame_type;
+        item.key_frame = key_frame;
+    };
+
+    auto render_cached_frame = [&](const cached_video_frame& cached, bool count_sync) {
+        if (!sdl_ok)
+            return;
+
+        SDL_UpdateYUVTexture(sdl_tex, NULL,
+                             cached.y.data(), OUT_W,
+                             cached.u.data(), OUT_W / 2,
+                             cached.v.data(), OUT_W / 2);
+
+        SDL_SetRenderDrawColor(sdl_ren, 0, 0, 0, 255);
+        SDL_RenderClear(sdl_ren);
+        SDL_Rect vid_rect = { 0, 0, OUT_W, OUT_H };
+        SDL_RenderCopy(sdl_ren, sdl_tex, NULL, &vid_rect);
+
+        if (count_sync)
+            record_video_play_pts(cached.pts_us, av_gettime_relative(), audio_dev_id);
+
+        char buf[256];
+        SDL_Color white = {220,220,220,255}, yellow = {255,220,80,255}, green = {100,255,100,255};
+        SDL_SetRenderDrawBlendMode(sdl_ren, SDL_BLENDMODE_BLEND);
+        SDL_Rect overlay_rect = { 12, 12, 360, 82 };
+        SDL_SetRenderDrawColor(sdl_ren, 0, 0, 0, 170);
+        SDL_RenderFillRect(sdl_ren, &overlay_rect);
+        int oy = 20;
+        snprintf(buf, sizeof(buf), "Frame: #%d  Type: %s%s",
+                 cached.frame_no,
+                 cached.frame_type.c_str(),
+                 cached.key_frame ? "  KEY" : "");
+        oy = render_text_line(sdl_ren, sdl_font, 24, oy, buf, yellow);
+        if (cached.pts_us == AV_NOPTS_VALUE)
+            snprintf(buf, sizeof(buf), "PTS: NOPTS");
+        else
+            snprintf(buf, sizeof(buf), "PTS: %lld us  %.3f s",
+                     (long long)cached.pts_us, cached.pts_us / 1000000.0);
+        render_text_line(sdl_ren, sdl_font, 24, oy, buf, white);
+        SDL_SetRenderDrawBlendMode(sdl_ren, SDL_BLENDMODE_NONE);
+
+        // ── 右侧面板 ──
+        SDL_Rect panel_rect = { OUT_W, 0, win_w - OUT_W, win_h };
+        SDL_SetRenderDrawColor(sdl_ren, 30, 30, 40, 255);
+        SDL_RenderFillRect(sdl_ren, &panel_rect);
+        SDL_SetRenderDrawColor(sdl_ren, 80, 80, 100, 255);
+        SDL_RenderDrawLine(sdl_ren, OUT_W, 0, OUT_W, win_h);
+
+        int px = OUT_W + 10, py = 10;
+
+        py = render_text_line(sdl_ren, sdl_font, px, py, "[ File Info ]", yellow);
+        snprintf(buf, sizeof(buf), "Name: %s", m_file_name.c_str()); py = render_text_line(sdl_ren, sdl_font, px, py, buf, white);
+        snprintf(buf, sizeof(buf), "Size: %dx%d", vid_w, vid_h); py = render_text_line(sdl_ren, sdl_font, px, py, buf, white);
+        snprintf(buf, sizeof(buf), "Codec: %s", codec_name); py = render_text_line(sdl_ren, sdl_font, px, py, buf, white);
+        snprintf(buf, sizeof(buf), "FPS(target): %.2f", fps); py = render_text_line(sdl_ren, sdl_font, px, py, buf, white);
+        snprintf(buf, sizeof(buf), "Duration: %llds", (long long)(m_fmtCtx->duration / AV_TIME_BASE)); py = render_text_line(sdl_ren, sdl_font, px, py, buf, white);
+
+        py += 8;
+        py = render_text_line(sdl_ren, sdl_font, px, py, "[ Real-time Stats ]", yellow);
+        snprintf(buf, sizeof(buf), "FPS(now): %.1f", realtime_fps); py = render_text_line(sdl_ren, sdl_font, px, py, buf, green);
+        snprintf(buf, sizeof(buf), "Video Pkts: %d", video_pkt_count); py = render_text_line(sdl_ren, sdl_font, px, py, buf, white);
+        snprintf(buf, sizeof(buf), "Audio Pkts: %d", audio_pkt_count); py = render_text_line(sdl_ren, sdl_font, px, py, buf, white);
+        snprintf(buf, sizeof(buf), "Keyframes: %d", keyframe_count); py = render_text_line(sdl_ren, sdl_font, px, py, buf, white);
+        snprintf(buf, sizeof(buf), "State: %s", paused ? "paused" : "playing"); py = render_text_line(sdl_ren, sdl_font, px, py, buf, yellow);
+
+        py += 8;
+        py = render_text_line(sdl_ren, sdl_font, px, py, "[ Current Frame ]", yellow);
+        snprintf(buf, sizeof(buf), "Frame No: %d", cached.frame_no); py = render_text_line(sdl_ren, sdl_font, px, py, buf, white);
+        snprintf(buf, sizeof(buf), "Cache Pos: %d/%d",
+                 frame_cache_index + 1, frame_cache_count);
+        py = render_text_line(sdl_ren, sdl_font, px, py, buf, white);
+        snprintf(buf, sizeof(buf), "Type: %s%s",
+                 cached.frame_type.c_str(), cached.key_frame ? " (KEY)" : "");
+        py = render_text_line(sdl_ren, sdl_font, px, py, buf, green);
+        if (cached.pts_us == AV_NOPTS_VALUE)
+            snprintf(buf, sizeof(buf), "PTS: NOPTS");
+        else
+            snprintf(buf, sizeof(buf), "PTS: %lld us", (long long)cached.pts_us);
+        py = render_text_line(sdl_ren, sdl_font, px, py, buf, white);
+        if (cached.pts_us != AV_NOPTS_VALUE) {
+            snprintf(buf, sizeof(buf), "PTS(sec): %.3f", cached.pts_us / 1000000.0);
+            py = render_text_line(sdl_ren, sdl_font, px, py, buf, white);
+        }
+
+        SDL_RenderPresent(sdl_ren);
+    };
+
+    auto rebuild_cache_to_frame = [&](int target_frame_no) -> bool {
+        video_frame_index *target_index = find_index_by_frame_no(target_frame_no);
+        if (!target_index || target_index->pts == AV_NOPTS_VALUE)
+            return false;
+
+        video_frame_index *seek_index = target_index;
+        for (int i = target_frame_no; i >= 1; i--) {
+            video_frame_index *candidate = find_index_by_frame_no(i);
+            if (candidate && candidate->key_frame && candidate->pts != AV_NOPTS_VALUE) {
+                seek_index = candidate;
+                break;
+            }
+        }
+
+        if (av_seek_frame(m_fmtCtx.get(), video_stream_index, seek_index->pts, AVSEEK_FLAG_BACKWARD) < 0) {
+            LOGD("seek failed: target frame=%d pts=%lld", target_frame_no, (long long)seek_index->pts);
+            return false;
+        }
+
+        avcodec_flush_buffers(decCtx.get());
+        if (audio_stream_index >= 0)
+            avcodec_flush_buffers(audio_dec_ctx.get());
+        if (audio_dev_id > 0)
+            SDL_ClearQueuedAudio(audio_dev_id);
+        m_audio_total_pushed_bytes = 0;
+        m_audio_source_pts_us = AV_NOPTS_VALUE;
+        m_audio_clock_ref_wall = 0;
+        m_audio_clock_ref_pts = AV_NOPTS_VALUE;
+
+        frame_cache_start = 0;
+        frame_cache_count = 0;
+        frame_cache_index = -1;
+
+        md_packet seek_pkt;
+        md_frame seek_frame;
+        int fallback_frame_no = seek_index->frame_no - 1;
+
+        while (av_read_frame(m_fmtCtx.get(), seek_pkt.get()) >= 0) {
+            if (seek_pkt->stream_index != video_stream_index) {
+                av_packet_unref(seek_pkt.get());
+                continue;
+            }
+
+            if (avcodec_send_packet(decCtx.get(), seek_pkt.get()) < 0) {
+                av_packet_unref(seek_pkt.get());
+                continue;
+            }
+            av_packet_unref(seek_pkt.get());
+
+            while (true) {
+                int ret = avcodec_receive_frame(decCtx.get(), seek_frame.get());
+                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+                    break;
+                if (ret < 0)
+                    return false;
+
+                bool frame_is_key = (seek_frame->flags & AV_FRAME_FLAG_KEY);
+                const char *frame_type = picture_type_str(seek_frame->pict_type, frame_is_key);
+                int64_t frame_pts = seek_frame->pts;
+                int64_t frame_pts_us = frame_pts != AV_NOPTS_VALUE
+                    ? av_rescale_q(frame_pts, m_fmtCtx->streams[video_stream_index]->time_base, (AVRational){1, 1000000})
+                    : AV_NOPTS_VALUE;
+
+                video_frame_index *known = find_index_by_pts(frame_pts);
+                int frame_no = known ? known->frame_no : ++fallback_frame_no;
+                if (!known)
+                    record_frame_index(frame_no, frame_pts, frame_pts_us, -1, frame_type, frame_is_key);
+
+                if (sws_ctx && scale_yuv_data[0])
+                    sws_scale(sws_ctx, seek_frame->data, seek_frame->linesize, 0, vid_h, scale_yuv_data, scale_yuv_linesize);
+                cache_current_frame(frame_pts_us, frame_no, frame_type, frame_is_key);
+
+                if (frame_no >= target_frame_no) {
+                    decoded_video_frame_count = frame_no;
+                    if (frame_cache_index >= 0)
+                        render_cached_frame(cache_ref(frame_cache_index), false);
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    };
+
+    auto show_previous_frame = [&]() {
+        if (frame_cache_index > 0) {
+            frame_cache_index--;
+            render_cached_frame(cache_ref(frame_cache_index), false);
+            return;
+        }
+        if (frame_cache_count <= 0)
+            return;
+
+        int target_frame_no = cache_ref(0).frame_no - 1;
+        if (target_frame_no > 0)
+            rebuild_cache_to_frame(target_frame_no);
+    };
+
+    auto show_next_frame = [&]() {
+        if (frame_cache_index + 1 < frame_cache_count) {
+            frame_cache_index++;
+            render_cached_frame(cache_ref(frame_cache_index), false);
+        } else {
+            step_next_frame = true;
+        }
+    };
 
     while (!quit) {
+        if (sdl_ok) {
+            SDL_Event event;
+            while (SDL_PollEvent(&event)) {
+                if (event.type == SDL_QUIT) {
+                    quit = true;
+                } else if (event.type == SDL_KEYDOWN) {
+                    if (event.key.keysym.sym == SDLK_ESCAPE) {
+                        quit = true;
+                    } else if (event.key.keysym.sym == SDLK_SPACE) {
+                        paused = !paused;
+                        step_next_frame = false;
+                        hold_prev_frame = false;
+                        hold_next_frame = false;
+                        if (audio_dev_id > 0)
+                            SDL_PauseAudioDevice(audio_dev_id, paused ? 1 : 0);
+                        if (!paused)
+                            last_ticks = SDL_GetTicks();
+                        if (paused && frame_cache_index >= 0)
+                            render_cached_frame(cache_ref(frame_cache_index), false);
+                    } else if (paused && event.key.keysym.sym == SDLK_LEFT) {
+                        show_previous_frame();
+                    } else if (paused && event.key.keysym.sym == SDLK_RIGHT) {
+                        show_next_frame();
+                    }
+                } else if (paused && event.type == SDL_MOUSEBUTTONDOWN) {
+                    if (event.button.button == SDL_BUTTON_LEFT) {
+                        hold_prev_frame = true;
+                        hold_next_frame = false;
+                        hold_next_tick = SDL_GetTicks() + 120;
+                        show_previous_frame();
+                    } else if (event.button.button == SDL_BUTTON_RIGHT) {
+                        hold_next_frame = true;
+                        hold_prev_frame = false;
+                        hold_next_tick = SDL_GetTicks() + 120;
+                        show_next_frame();
+                    }
+                } else if (event.type == SDL_MOUSEBUTTONUP) {
+                    if (event.button.button == SDL_BUTTON_LEFT) {
+                        hold_prev_frame = false;
+                    } else if (event.button.button == SDL_BUTTON_RIGHT) {
+                        hold_next_frame = false;
+                    }
+                }
+            }
+        }
+        if (quit) break;
+        if (paused && !step_next_frame && (hold_prev_frame || hold_next_frame)) {
+            uint32_t now = SDL_GetTicks();
+            if (now >= hold_next_tick) {
+                if (hold_prev_frame)
+                    show_previous_frame();
+                else if (hold_next_frame)
+                    show_next_frame();
+                hold_next_tick = SDL_GetTicks() + 120;
+            }
+        }
+        if (paused && !step_next_frame) {
+            SDL_Delay(10);
+            continue;
+        }
+
         int read_ret = av_read_frame(m_fmtCtx.get(), pkt.get());
         if (read_ret < 0) {
             if(loop)
@@ -399,6 +786,11 @@ std::int16_t md_file::play(bool loop)
                 if (audio_stream_index >= 0) avcodec_flush_buffers(audio_dec_ctx.get());
                 av_seek_frame(m_fmtCtx.get(), -1, 0, AVSEEK_FLAG_BACKWARD);
                 video_pkt_count = 0; audio_pkt_count = 0; keyframe_count = 0; non_keyframe_count = 0;
+                decoded_video_frame_count = 0;
+                frame_cache_start = 0;
+                frame_cache_count = 0;
+                frame_cache_index = -1;
+                frame_index_list.clear();
                 fps_frame_count = 0; fps_last_tick = SDL_GetTicks(); realtime_fps = 0.0;
                 av_packet_unref(pkt.get());
                 continue;
@@ -408,18 +800,11 @@ std::int16_t md_file::play(bool loop)
 
         }
 
-        // 事件
-        if (sdl_ok) {
-            SDL_Event event;
-            while (SDL_PollEvent(&event)) {
-                if (event.type == SDL_QUIT) quit = true;
-                else if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE) quit = true;
-            }
-        }
-        if (quit) break;
-
         if (pkt->stream_index == video_stream_index) {
+            int64_t video_pkt_pos = pkt->pos;
             video_pkt_count++;
+            if (DEBUG_FRAME_LOGS)
+                LOGD("vp_c=%d, kf?=%d", video_pkt_count, pkt->flags & AV_PKT_FLAG_KEY);
             if (pkt->flags & AV_PKT_FLAG_KEY) keyframe_count++;
             else non_keyframe_count++;
 
@@ -429,12 +814,14 @@ std::int16_t md_file::play(bool loop)
 
             int ret = avcodec_receive_frame(decCtx.get(), frame.get());
             if (ret == 0) {
+                decoded_video_frame_count++;
                 if (m_width != frame->width || m_height != frame->height) {
                     m_width = frame->width; m_height = frame->height;
                 }
+                bool frame_is_key = (frame->flags & AV_FRAME_FLAG_KEY);
+                const char *frame_type = picture_type_str(frame->pict_type, frame_is_key);
                 
-                // 显示帧类型
-                {
+                if (DEBUG_FRAME_LOGS) {
                     switch (frame->pict_type) {
                     case AV_PICTURE_TYPE_I: 
                         LOGD("video_pkt_count %d I-frame", video_pkt_count);
@@ -466,14 +853,17 @@ std::int16_t md_file::play(bool loop)
                 if (sws_ctx && scale_yuv_data[0])
                     sws_scale(sws_ctx, frame->data, frame->linesize, 0, vid_h, scale_yuv_data, scale_yuv_linesize);
 
-                if (sws_rgb_ctx && scale_rgb_data[0]) {
+                int64_t frame_pts_us = frame->pts != AV_NOPTS_VALUE
+                    ? av_rescale_q(frame->pts, m_fmtCtx->streams[video_stream_index]->time_base, (AVRational){1, 1000000})
+                    : AV_NOPTS_VALUE;
+                record_frame_index(decoded_video_frame_count, frame->pts, frame_pts_us,
+                                   video_pkt_pos, frame_type, frame_is_key);
+                cache_current_frame(frame_pts_us, decoded_video_frame_count, frame_type, frame_is_key);
+
+                if (!snapshot_saved && sws_rgb_ctx && scale_rgb_data[0]) {
                     sws_scale(sws_rgb_ctx, frame->data, frame->linesize, 0, vid_h, scale_rgb_data, scale_rgb_linesize);
-                    static int snap_count = 0;
-                    if (snap_count == 0) {
-                        char fname[64]; snprintf(fname, sizeof(fname), "snap_%03d.bmp", snap_count);
-                        save_rgb_to_bmp(fname, scale_rgb_data[0], OUT_W, OUT_H);
-                        snap_count++;
-                    }
+                    save_rgb_to_bmp("snap_000.bmp", scale_rgb_data[0], OUT_W, OUT_H);
+                    snapshot_saved = true;
                 }
 
                 // 帧率统计
@@ -486,58 +876,30 @@ std::int16_t md_file::play(bool loop)
 
                 // 显示
                 if (sdl_ok) {
-                    uint32_t now = SDL_GetTicks();
-                    int elapsed = now - last_ticks;
-                    if (elapsed < frame_delay_ms) SDL_Delay(frame_delay_ms - elapsed);
-                    last_ticks = SDL_GetTicks();
-
-                    SDL_UpdateYUVTexture(sdl_tex, NULL, scale_yuv_data[0], scale_yuv_linesize[0],
-                                         scale_yuv_data[1], scale_yuv_linesize[1], scale_yuv_data[2], scale_yuv_linesize[2]);
-
-                    SDL_SetRenderDrawColor(sdl_ren, 0, 0, 0, 255);
-                    SDL_RenderClear(sdl_ren);
-                    SDL_Rect vid_rect = { 0, 0, OUT_W, OUT_H };
-                    SDL_RenderCopy(sdl_ren, sdl_tex, NULL, &vid_rect);
-
-                    // ── 记录视频帧播放时间戳（使用墙钟时间，反映实际显示时刻） ──
-                    {
-                        int64_t pts_us = frame->pts != AV_NOPTS_VALUE
-                            ? av_rescale_q(frame->pts, m_fmtCtx->streams[video_stream_index]->time_base, (AVRational){1, 1000000})
-                            : AV_NOPTS_VALUE;
-                        int64_t render_wall_us = av_gettime_relative();
-                        record_video_play_pts(pts_us, render_wall_us, audio_dev_id);
+                    if (frame_cache_index >= 0)
+                        render_cached_frame(cache_ref(frame_cache_index), !paused);
+                    if (!paused) {
+                        uint32_t now = SDL_GetTicks();
+                        int elapsed = now - last_ticks;
+                        if (elapsed < frame_delay_ms) {
+                            SDL_Delay(frame_delay_ms - elapsed);
+                            now = SDL_GetTicks();
+                        }
+                        last_ticks = now;
                     }
-
-                    // ── 右侧面板 ──
-                    SDL_Rect panel_rect = { OUT_W, 0, win_w - OUT_W, win_h };
-                    SDL_SetRenderDrawColor(sdl_ren, 30, 30, 40, 255);
-                    SDL_RenderFillRect(sdl_ren, &panel_rect);
-                    SDL_SetRenderDrawColor(sdl_ren, 80, 80, 100, 255);
-                    SDL_RenderDrawLine(sdl_ren, vid_w, 0, vid_w, win_h);
-
-                    SDL_Color white = {220,220,220,255}, yellow = {255,220,80,255}, green = {100,255,100,255};
-                    int px = OUT_W + 10, py = 10;
-
-                    py = render_text_line(sdl_ren, sdl_font, px, py, "[ File Info ]", yellow);
-                    char buf[256];
-                    snprintf(buf, sizeof(buf), "Name: %s", m_file_name.c_str()); py = render_text_line(sdl_ren, sdl_font, px, py, buf, white);
-                    snprintf(buf, sizeof(buf), "Size: %dx%d", vid_w, vid_h); py = render_text_line(sdl_ren, sdl_font, px, py, buf, white);
-                    snprintf(buf, sizeof(buf), "Codec: %s", codec_name); py = render_text_line(sdl_ren, sdl_font, px, py, buf, white);
-                    snprintf(buf, sizeof(buf), "FPS(target): %.2f", fps); py = render_text_line(sdl_ren, sdl_font, px, py, buf, white);
-                    snprintf(buf, sizeof(buf), "Duration: %llds", (long long)(m_fmtCtx->duration / AV_TIME_BASE)); py = render_text_line(sdl_ren, sdl_font, px, py, buf, white);
-
-                    py += 8;
-                    py = render_text_line(sdl_ren, sdl_font, px, py, "[ Real-time Stats ]", yellow);
-                    snprintf(buf, sizeof(buf), "FPS(now): %.1f", realtime_fps); py = render_text_line(sdl_ren, sdl_font, px, py, buf, green);
-                    snprintf(buf, sizeof(buf), "Video Pkts: %d", video_pkt_count); py = render_text_line(sdl_ren, sdl_font, px, py, buf, white);
-                    snprintf(buf, sizeof(buf), "Audio Pkts: %d", audio_pkt_count); py = render_text_line(sdl_ren, sdl_font, px, py, buf, white);
-                    snprintf(buf, sizeof(buf), "Keyframes: %d", keyframe_count); py = render_text_line(sdl_ren, sdl_font, px, py, buf, white);
-
-                    SDL_RenderPresent(sdl_ren);
                 }
+                if (paused && step_next_frame)
+                    step_next_frame = false;
+            }else{
+                LOGD("avcodec_receive_frame video failed: %d", ret);
+                LOGD("is keyframe? %d", pkt->flags & AV_PKT_FLAG_KEY);
             }
 
         } else if (pkt->stream_index == audio_stream_index) {
+            if (paused) {
+                av_packet_unref(pkt.get());
+                continue;
+            }
             audio_pkt_count++;
             if (avcodec_send_packet(audio_dec_ctx.get(), pkt.get()) < 0) { av_packet_unref(pkt.get()); continue; }
 
